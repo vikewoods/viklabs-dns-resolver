@@ -1,11 +1,14 @@
 package main
 
 import (
+	"context"
+	"fmt"
 	"log"
-	"sync"
+	"os"
 	"time"
 
 	"github.com/miekg/dns"
+	"github.com/redis/go-redis/v9"
 )
 
 // Upstream DNS servers
@@ -22,28 +25,35 @@ var dnsClient = &dns.Client{
 	SingleInflight: true,
 }
 
-// Simple in-memory cache
-// TODO: Add Redis cache support
-type CacheEntry struct {
-	Response  *dns.Msg
-	ExpiresAt time.Time
-}
-
-var (
-	cache      = make(map[string]*CacheEntry)
-	cacheMutex sync.RWMutex
-	cacheTTL   = 5 * time.Minute // Default cache TTL
-)
+// Redis client
+var redisClient *redis.Client
+var ctx = context.Background()
 
 func main() {
-	// Bind to IP or Network Interface
-	listenAddr := "192.168.190.25:5454"
+	// Get configuration from environment variables
+	listenAddr := getEnv("LISTEN_ADDR", "0.0.0.0:5454")
+	redisAddr := getEnv("REDIS_ADDR", "localhost:6379")
+	redisPassword := getEnv("REDIS_PASSWORD", "")
+
+	// Initialize Redis
+	redisClient = redis.NewClient(&redis.Options{
+		Addr:         redisAddr,
+		Password:     redisPassword,
+		DB:           0,
+		DialTimeout:  5 * time.Second,
+		ReadTimeout:  3 * time.Second,
+		WriteTimeout: 3 * time.Second,
+		PoolSize:     10,
+	})
+
+	// Test Redis connection
+	if err := redisClient.Ping(ctx).Err(); err != nil {
+		log.Fatalf("[***] Failed to connect to Redis: %v", err)
+	}
+	log.Println("[**] Connected to Redis successfully")
 
 	// Handle all DNS zones with our handler
 	dns.HandleFunc(".", handleDNSRequest)
-
-	// Start cache cleanup goroutine
-	go cleanupCache()
 
 	// UDP server
 	udpServer := &dns.Server{
@@ -62,7 +72,7 @@ func main() {
 
 	// Start UDP server
 	go func() {
-		log.Printf("Starting DNS server on UDP %s", listenAddr)
+		log.Printf("[*] Starting DNS server on UDP %s", listenAddr)
 		if err := udpServer.ListenAndServe(); err != nil {
 			log.Fatalf("Failed to start UDP server: %v", err)
 		}
@@ -70,18 +80,20 @@ func main() {
 
 	// Start TCP server
 	go func() {
-		log.Printf("Starting DNS server on TCP %s", listenAddr)
+		log.Printf("[*] Starting DNS server on TCP %s", listenAddr)
 		if err := tcpServer.ListenAndServe(); err != nil {
 			log.Fatalf("Failed to start TCP server: %v", err)
 		}
 	}()
 
-	log.Println("DNS resolver is running. Press Ctrl+C to stop.")
+	log.Println("[*] DNS resolver is running. Press Ctrl+C to stop.")
 	select {}
 }
 
-// handleDNSRequest handles incoming DNS queries with caching
+// handleDNSRequest handles incoming DNS queries with Redis caching
 func handleDNSRequest(w dns.ResponseWriter, r *dns.Msg) {
+	startTime := time.Now()
+
 	if len(r.Question) == 0 {
 		sendError(w, r, dns.RcodeFormatError)
 		return
@@ -90,29 +102,40 @@ func handleDNSRequest(w dns.ResponseWriter, r *dns.Msg) {
 	q := r.Question[0]
 	cacheKey := getCacheKey(q)
 
-	// Check cache first
-	if cachedResp := getFromCache(cacheKey); cachedResp != nil {
-		cachedResp.Id = r.Id // Match request ID
+	// Check Redis cache first
+	cachedResp, cacheHit := getFromRedisCache(cacheKey)
+	if cacheHit && cachedResp != nil {
+		cachedResp.Id = r.Id
 		_ = w.WriteMsg(cachedResp)
+		log.Printf("[+] CACHE_HIT | %s | %s | %dms",
+			dns.TypeToString[q.Qtype],
+			q.Name,
+			time.Since(startTime).Milliseconds())
 		return
 	}
 
 	// Forward to upstream
 	resp, err := forwardToUpstream(r)
 	if err != nil {
-		log.Printf("Upstream error for %s: %v", q.Name, err)
+		log.Printf("[-] ERROR | %s | %s | %v", dns.TypeToString[q.Qtype], q.Name, err)
 		sendError(w, r, dns.RcodeServerFailure)
 		return
 	}
 
-	// Cache the response
-	saveToCache(cacheKey, resp)
+	// Save to Redis cache
+	saveToRedisCache(cacheKey, resp)
 
 	// Send response
 	resp.Id = r.Id
 	if err := w.WriteMsg(resp); err != nil {
-		log.Printf("Failed to write response: %v", err)
+		log.Printf("[---] ERROR | Failed to write response: %v", err)
+		return
 	}
+
+	log.Printf("[+] UPSTREAM | %s | %s | %dms",
+		dns.TypeToString[q.Qtype],
+		q.Name,
+		time.Since(startTime).Milliseconds())
 }
 
 // forwardToUpstream sends the DNS query to upstream servers with retries
@@ -123,6 +146,7 @@ func forwardToUpstream(req *dns.Msg) (*dns.Msg, error) {
 		resp, _, err := dnsClient.Exchange(req, upstream)
 		if err != nil {
 			lastErr = err
+			log.Printf("[--] WARN | Upstream %s failed: %v", upstream, err)
 			continue
 		}
 
@@ -135,61 +159,54 @@ func forwardToUpstream(req *dns.Msg) (*dns.Msg, error) {
 	if lastErr != nil {
 		return nil, lastErr
 	}
-	return nil, dns.ErrId
+	return nil, fmt.Errorf("all upstream servers failed")
 }
 
-// Cache helper functions
+// Redis Cache Functions
 func getCacheKey(q dns.Question) string {
-	return q.Name + ":" + dns.TypeToString[q.Qtype]
+	return fmt.Sprintf("dns:%s:%s", q.Name, dns.TypeToString[q.Qtype])
 }
 
-func getFromCache(key string) *dns.Msg {
-	cacheMutex.RLock()
-	defer cacheMutex.RUnlock()
-
-	entry, exists := cache[key]
-	if !exists || time.Now().After(entry.ExpiresAt) {
-		return nil
+func getFromRedisCache(key string) (*dns.Msg, bool) {
+	data, err := redisClient.Get(ctx, key).Bytes()
+	if err != nil {
+		return nil, false // Cache miss or error
 	}
 
-	return entry.Response.Copy()
+	msg := new(dns.Msg)
+	if err := msg.Unpack(data); err != nil {
+		log.Printf("[--] WARN | Failed to unpack cached DNS message: %v", err)
+		return nil, false
+	}
+
+	return msg, true
 }
 
-func saveToCache(key string, msg *dns.Msg) {
-	cacheMutex.Lock()
-	defer cacheMutex.Unlock()
+func saveToRedisCache(key string, msg *dns.Msg) {
+	// Calculate TTL from DNS response
+	ttl := 5 * time.Minute // Default TTL
 
-	// Use the minimum TTL from the response or default
-	ttl := cacheTTL
 	if len(msg.Answer) > 0 {
 		ttl = time.Duration(msg.Answer[0].Header().Ttl) * time.Second
-		if ttl > 5*time.Minute {
-			ttl = 5 * time.Minute
+		// Cap TTL between 30s and 15 min
+		if ttl > 15*time.Minute {
+			ttl = 15 * time.Minute
 		}
 		if ttl < 30*time.Second {
 			ttl = 30 * time.Second
 		}
 	}
 
-	cache[key] = &CacheEntry{
-		Response:  msg.Copy(),
-		ExpiresAt: time.Now().Add(ttl),
+	// Pack DNS message to binary
+	data, err := msg.Pack()
+	if err != nil {
+		log.Printf("[--] WARN | Failed to pack DNS message for caching: %v", err)
+		return
 	}
-}
 
-func cleanupCache() {
-	ticker := time.NewTicker(1 * time.Minute)
-	defer ticker.Stop()
-
-	for range ticker.C {
-		cacheMutex.Lock()
-		now := time.Now()
-		for key, entry := range cache {
-			if now.After(entry.ExpiresAt) {
-				delete(cache, key)
-			}
-		}
-		cacheMutex.Unlock()
+	// Save to Redis with TTL
+	if err := redisClient.Set(ctx, key, data, ttl).Err(); err != nil {
+		log.Printf("[--] WARN | Failed to save to Redis cache: %v", err)
 	}
 }
 
@@ -198,4 +215,11 @@ func sendError(w dns.ResponseWriter, r *dns.Msg, rcode int) {
 	m.SetReply(r)
 	m.Rcode = rcode
 	_ = w.WriteMsg(m)
+}
+
+func getEnv(key, defaultValue string) string {
+	if value := os.Getenv(key); value != "" {
+		return value
+	}
+	return defaultValue
 }
