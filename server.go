@@ -231,9 +231,9 @@ func saveToRedisCache(key string, msg *dns.Msg) {
 
 	if len(msg.Answer) > 0 {
 		ttl = time.Duration(msg.Answer[0].Header().Ttl) * time.Second
-		// Cap TTL between 30s and 15 min
-		if ttl > 15*time.Minute {
-			ttl = 15 * time.Minute
+		// Cap TTL between 30s and 60 min
+		if ttl > 1*time.Hour {
+			ttl = 1 * time.Hour
 		}
 		if ttl < 30*time.Second {
 			ttl = 30 * time.Second
