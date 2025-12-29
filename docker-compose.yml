@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   redis:
     image: redis:7-alpine
@@ -9,7 +7,12 @@ services:
       - "6379:6379"
     volumes:
       - redis-data:/data
-    command: redis-server --appendonly yes
+    command: >
+      redis-server
+      --appendonly yes
+      --maxmemory 512mb
+      --maxmemory-policy allkeys-lru
+      --save 60 1000
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
@@ -17,6 +20,14 @@ services:
       retries: 3
     networks:
       - dns-network
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 1G
+        reservations:
+          cpus: '0.5'
+          memory: 256M
 
   dns-resolver:
     build: .
@@ -29,11 +40,23 @@ services:
       - LISTEN_ADDR=0.0.0.0:5454
       - REDIS_ADDR=redis:6379
       - REDIS_PASSWORD=
+      - REDIS_POOL_SIZE=100
+      - GOMAXPROCS=0              # 0 = use all available CPUs
+      - GOGC=200                  # GC runs less frequently (more memory, better performance)
+      - GOMEMLIMIT=1536MiB        # Soft memory limit (leave headroom for OS)
     depends_on:
       redis:
         condition: service_healthy
     networks:
       - dns-network
+    deploy:
+      resources:
+        limits:
+          cpus: '4'
+          memory: 2G
+        reservations:
+          cpus: '1'
+          memory: 512M
 
 networks:
   dns-network:

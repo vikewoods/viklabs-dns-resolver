@@ -5,6 +5,9 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"runtime"
+	"runtime/debug"
+	"strconv"
 	"time"
 
 	"github.com/miekg/dns"
@@ -30,20 +33,27 @@ var redisClient *redis.Client
 var ctx = context.Background()
 
 func main() {
+	// Configure Go runtime for maximum performance
+	configureRuntime()
+
 	// Get configuration from environment variables
 	listenAddr := getEnv("LISTEN_ADDR", "0.0.0.0:5454")
 	redisAddr := getEnv("REDIS_ADDR", "localhost:6379")
 	redisPassword := getEnv("REDIS_PASSWORD", "")
+	redisPoolSize := getEnvInt("REDIS_POOL_SIZE", 100)
 
-	// Initialize Redis
+	// Initialize Redis with optimized settings
 	redisClient = redis.NewClient(&redis.Options{
 		Addr:         redisAddr,
 		Password:     redisPassword,
 		DB:           0,
 		DialTimeout:  5 * time.Second,
-		ReadTimeout:  3 * time.Second,
-		WriteTimeout: 3 * time.Second,
-		PoolSize:     10,
+		ReadTimeout:  2 * time.Second,
+		WriteTimeout: 2 * time.Second,
+		PoolSize:     redisPoolSize,
+		MinIdleConns: redisPoolSize / 4,
+		MaxRetries:   2,
+		PoolTimeout:  3 * time.Second,
 	})
 
 	// Test Redis connection
@@ -55,7 +65,7 @@ func main() {
 	// Handle all DNS zones with our handler
 	dns.HandleFunc(".", handleDNSRequest)
 
-	// UDP server
+	// UDP server with optimized settings
 	udpServer := &dns.Server{
 		Addr:      listenAddr,
 		Net:       "udp",
@@ -63,7 +73,7 @@ func main() {
 		UDPSize:   65535,
 	}
 
-	// TCP server
+	// TCP server with optimized settings
 	tcpServer := &dns.Server{
 		Addr:      listenAddr,
 		Net:       "tcp",
@@ -86,8 +96,41 @@ func main() {
 		}
 	}()
 
+	// Log runtime configuration
+	logRuntimeInfo()
+
 	log.Println("[*] DNS resolver is running. Press Ctrl+C to stop.")
 	select {}
+}
+
+// configureRuntime optimizes Go runtime settings for maximum performance
+func configureRuntime() {
+	// Get GOMAXPROCS from environment or use all CPUs
+	maxProcs := getEnvInt("GOMAXPROCS", runtime.NumCPU())
+	runtime.GOMAXPROCS(maxProcs)
+
+	// Set GC target percentage (lower = more frequent GC, less memory usage)
+	// Higher = less frequent GC, more memory usage, better performance
+	gcPercent := getEnvInt("GOGC", 200)
+	debug.SetGCPercent(gcPercent)
+
+	// Set memory limit if specified (e.g., "512MiB", "2GiB")
+	if memLimit := os.Getenv("GOMEMLIMIT"); memLimit != "" {
+		debug.SetMemoryLimit(parseMemoryLimit(memLimit))
+	}
+}
+
+// logRuntimeInfo logs current runtime configuration
+func logRuntimeInfo() {
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+
+	log.Printf("[**] Runtime Configuration:")
+	log.Printf("    - GOMAXPROCS: %d (available CPUs: %d)", runtime.GOMAXPROCS(0), runtime.NumCPU())
+	log.Printf("    - GOGC: %d%%", debug.SetGCPercent(-1))
+	debug.SetGCPercent(debug.SetGCPercent(-1))
+	log.Printf("    - Goroutines: %d", runtime.NumGoroutine())
+	log.Printf("    - Memory Allocated: %.2f MB", float64(m.Alloc)/1024/1024)
 }
 
 // handleDNSRequest handles incoming DNS queries with Redis caching
@@ -122,8 +165,8 @@ func handleDNSRequest(w dns.ResponseWriter, r *dns.Msg) {
 		return
 	}
 
-	// Save to Redis cache
-	saveToRedisCache(cacheKey, resp)
+	// Save to Redis cache (non-blocking)
+	go saveToRedisCache(cacheKey, resp)
 
 	// Send response
 	resp.Id = r.Id
@@ -184,7 +227,7 @@ func getFromRedisCache(key string) (*dns.Msg, bool) {
 
 func saveToRedisCache(key string, msg *dns.Msg) {
 	// Calculate TTL from DNS response
-	ttl := 5 * time.Minute // Default TTL
+	ttl := 5 * time.Minute
 
 	if len(msg.Answer) > 0 {
 		ttl = time.Duration(msg.Answer[0].Header().Ttl) * time.Second
@@ -217,9 +260,45 @@ func sendError(w dns.ResponseWriter, r *dns.Msg, rcode int) {
 	_ = w.WriteMsg(m)
 }
 
+// Helper functions
 func getEnv(key, defaultValue string) string {
 	if value := os.Getenv(key); value != "" {
 		return value
 	}
 	return defaultValue
+}
+
+func getEnvInt(key string, defaultValue int) int {
+	if value := os.Getenv(key); value != "" {
+		if intVal, err := strconv.Atoi(value); err == nil {
+			return intVal
+		}
+	}
+	return defaultValue
+}
+
+func parseMemoryLimit(limit string) int64 {
+	// Simple parser for memory limits like "512MiB", "2GiB"
+	var multiplier int64 = 1
+	numStr := limit
+
+	if len(limit) > 3 {
+		suffix := limit[len(limit)-3:]
+		numStr = limit[:len(limit)-3]
+
+		switch suffix {
+		case "KiB":
+			multiplier = 1024
+		case "MiB":
+			multiplier = 1024 * 1024
+		case "GiB":
+			multiplier = 1024 * 1024 * 1024
+		}
+	}
+
+	if num, err := strconv.ParseInt(numStr, 10, 64); err == nil {
+		return num * multiplier
+	}
+
+	return -1 // No limit
 }
