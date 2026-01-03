@@ -313,18 +313,28 @@ func parseMemoryLimit(limit string) int64 {
 	return -1 // No limit
 }
 
-func logMemStats() {
-	ticker := time.NewTicker(15 * time.Minute)
+func logMemStatsTimer() {
+	// Get interval from environment (in minutes), default to 15
+	intervalMinutes := getEnvInt("MEM_STATS_INTERVAL", 15)
+	interval := time.Duration(intervalMinutes) * time.Minute
+
+	logMemStats()
+
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	for range ticker.C {
-		var m runtime.MemStats
-		runtime.ReadMemStats(&m)
-		log.Printf("[**] Memory Stats: Alloc=%.2fMB, TotalAlloc=%.2fMB, Sys=%.2fMB, NumGC=%d, Goroutines=%d",
-			float64(m.Alloc)/1024/1024,
-			float64(m.TotalAlloc)/1024/1024,
-			float64(m.Sys)/1024/1024,
-			m.NumGC,
-			runtime.NumGoroutine())
+		logMemStats()
 	}
+}
+
+func logMemStats() {
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	log.Printf("[**] Memory Stats: Alloc=%.2fMB, TotalAlloc=%.2fMB, Sys=%.2fMB, NumGC=%d, Goroutines=%d",
+		float64(m.Alloc)/1024/1024,
+		float64(m.TotalAlloc)/1024/1024,
+		float64(m.Sys)/1024/1024,
+		m.NumGC,
+		runtime.NumGoroutine())
 }
