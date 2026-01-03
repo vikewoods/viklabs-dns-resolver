@@ -8,6 +8,7 @@ import (
 	"runtime"
 	"runtime/debug"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/miekg/dns"
@@ -28,6 +29,10 @@ var dnsClient = &dns.Client{
 	SingleInflight: true,
 }
 
+var msgPool = &sync.Pool{
+	New: func() interface{} { return new(dns.Msg) },
+}
+
 // Redis client
 var redisClient *redis.Client
 var ctx = context.Background()
@@ -44,16 +49,17 @@ func main() {
 
 	// Initialize Redis with optimized settings
 	redisClient = redis.NewClient(&redis.Options{
-		Addr:         redisAddr,
-		Password:     redisPassword,
-		DB:           0,
-		DialTimeout:  5 * time.Second,
-		ReadTimeout:  2 * time.Second,
-		WriteTimeout: 2 * time.Second,
-		PoolSize:     redisPoolSize,
-		MinIdleConns: redisPoolSize / 4,
-		MaxRetries:   2,
-		PoolTimeout:  3 * time.Second,
+		Addr:            redisAddr,
+		Password:        redisPassword,
+		DB:              0,
+		DialTimeout:     3 * time.Second,
+		ReadTimeout:     1 * time.Second,
+		WriteTimeout:    1 * time.Second,
+		PoolSize:        redisPoolSize,
+		MinIdleConns:    10,
+		MaxRetries:      1,
+		PoolTimeout:     2 * time.Second,
+		ConnMaxIdleTime: 5 * time.Minute,
 	})
 
 	// Test Redis connection
@@ -98,6 +104,9 @@ func main() {
 
 	// Log runtime configuration
 	logRuntimeInfo()
+
+	// Mem stats logger
+	go logMemStats()
 
 	log.Println("[*] DNS resolver is running. Press Ctrl+C to stop.")
 	select {}
@@ -254,10 +263,11 @@ func saveToRedisCache(key string, msg *dns.Msg) {
 }
 
 func sendError(w dns.ResponseWriter, r *dns.Msg, rcode int) {
-	m := new(dns.Msg)
+	m := msgPool.Get().(*dns.Msg)
 	m.SetReply(r)
 	m.Rcode = rcode
 	_ = w.WriteMsg(m)
+	msgPool.Put(m)
 }
 
 // Helper functions
@@ -301,4 +311,20 @@ func parseMemoryLimit(limit string) int64 {
 	}
 
 	return -1 // No limit
+}
+
+func logMemStats() {
+	ticker := time.NewTicker(15 * time.Minute)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		var m runtime.MemStats
+		runtime.ReadMemStats(&m)
+		log.Printf("[**] Memory Stats: Alloc=%.2fMB, TotalAlloc=%.2fMB, Sys=%.2fMB, NumGC=%d, Goroutines=%d",
+			float64(m.Alloc)/1024/1024,
+			float64(m.TotalAlloc)/1024/1024,
+			float64(m.Sys)/1024/1024,
+			m.NumGC,
+			runtime.NumGoroutine())
+	}
 }

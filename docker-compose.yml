@@ -43,7 +43,7 @@ services:
       - REDIS_POOL_SIZE=100
       - GOMAXPROCS=0              # 0 = use all available CPUs
       - GOGC=200                  # GC runs less frequently (more memory, better performance)
-      - GOMEMLIMIT=1536MiB        # Soft memory limit (leave headroom for OS)
+      - GOMEMLIMIT=768MiB        # Soft memory limit (leave headroom for OS)
     depends_on:
       redis:
         condition: service_healthy
