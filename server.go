@@ -106,7 +106,7 @@ func main() {
 	logRuntimeInfo()
 
 	// Mem stats logger
-	go logMemStats()
+	go logMemStatsTimer()
 
 	log.Println("[*] DNS resolver is running. Press Ctrl+C to stop.")
 	select {}
