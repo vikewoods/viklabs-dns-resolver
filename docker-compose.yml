@@ -9,10 +9,17 @@ services:
       - redis-data:/data
     command: >
       redis-server
-      --appendonly yes
+      --appendonly no
       --maxmemory 512mb
       --maxmemory-policy allkeys-lru
-      --save 60 1000
+      --save ""
+      --tcp-backlog 511
+      --timeout 300
+      --tcp-keepalive 60
+      --loglevel notice
+      --activerehashing yes
+      --lazyfree-lazy-eviction yes
+      --lazyfree-lazy-expire yes
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
